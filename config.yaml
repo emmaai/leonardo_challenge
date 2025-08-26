@@ -1,0 +1,41 @@
+weights:
+  alpha_embed: 0.45
+  beta_caption: 0.20
+  gamma_ground: 0.20
+  delta_vqa: 0.15
+calibration:
+  num_random_negatives: 16
+grounded_weights:
+  entity: 0.5
+  attribute: 0.3
+  relation: 0.2
+str_sim_threshold: 0.6
+
+models:
+  embedding:
+    target: "matcher:HFCLIPAdapter"
+    init: { model_name: "openai/clip-vit-base-patch32" }
+
+  captioner:
+    target: "transformers:pipeline"
+    init: { task: "image-to-text", model: "Salesforce/blip-image-captioning-large" }
+    wrapper:
+      target: "matcher:_CaptionCallableWrapper"
+      init: { method: "__call__", key: "generated_text" }
+
+  sts:
+    target: "sentence_transformers:SentenceTransformer"
+    init: { model_name_or_path: "all-mpnet-base-v2" }
+    wrapper:
+      target: "matcher:_SBERTLikeSTSWrapper"
+      init: { encode_method: "encode" }
+
+  grounding:
+    target: "transformers:pipeline"
+    init: { task: "zero-shot-object-detection", model: "google/owlvit-base-patch32" }
+    wrapper: { target: "matcher:HFZeroShotDetAdapter" }
+
+  vqa:
+    target: "transformers:pipeline"
+    init: { task: "visual-question-answering", model: "dandelin/vilt-b32-finetuned-vqa" }
+    wrapper: { target: "matcher:HFVQAPipelineAdapter" }
