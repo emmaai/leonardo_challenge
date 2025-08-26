@@ -1,0 +1,18 @@
+# --- Core runtime ---
+pillow>=10.0
+numpy>=1.24
+pyyaml>=6.0.1
+click>=8.1
+
+# --- Default model stack (Hugging Face) ---
+transformers>=4.40
+sentence-transformers>=2.6
+accelerate>=0.28
+timm>=0.9
+torch>=2.2
+
+# Tip: for NVIDIA GPUs, install a CUDA-matching torch build if needed, e.g.:
+# pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+
+# (Optional) running the test suite
+pytest>=7.0
