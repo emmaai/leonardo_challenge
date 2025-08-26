@@ -7,7 +7,7 @@ from PIL import Image as PILImage
 import numpy as np
 from numpy.typing import NDArray
 
-Embedding = NDArray
+Embedding = NDArray[np.floating]
 
 # ================
 # Math utilities
@@ -33,6 +33,25 @@ def soft_f1(prec: float, rec: float, eps: float = 1e-8) -> float:
 # Text/token utilities
 # ===================
 _token_pattern = re.compile(r"[A-Za-z0-9\-]+")
+
+# Pattern: .../users/<HASH>/...
+_LEONARDO_USERS_RE = re.compile(r"/users/([A-Za-z0-9\-]+)/")
+
+
+def url_to_local_png(url_or_path: str) -> str:
+    """Map a Leonardo CDN URL to a local file name.
+
+    Example:
+    https://cdn.leonardo.ai/users/85498bb1-.../generations/.../file.jpg
+    → ./85498bb1-....png
+
+    If the pattern isn't found, the input is returned unchanged.
+    """
+    m = _LEONARDO_USERS_RE.search(url_or_path)
+    if not m:
+        return url_or_path
+    return f"{m.group(1)}.png"
+
 
 def simple_tokenize(s: str) -> list[str]:
     return _token_pattern.findall(s.lower())
@@ -60,61 +79,3 @@ def pairwise_best_match(targets: list[str], found: list[str], thresh: float) -> 
             matched += 1
             used.add(best_j)
     return matched, len(targets)
-
-# ==============================
-# Standalone VQA question maker
-# ==============================
-
-def generate_vqa_questions(prompt: str, limit: int = 12) -> list[str]:
-    """Minimal, rule-based expansion of a prompt into yes/no checks.
-    Replace with spaCy/LLM for better coverage.
-    """
-    text = prompt.strip()
-    tokens = simple_tokenize(text)
-
-    colors = {
-        "red","blue","green","yellow","purple","orange","pink",
-        "black","white","gray","grey","brown","gold","silver",
-    }
-    sizes = {"small","big","large","tiny","huge","massive","miniature"}
-
-    # naïve object guess: non-attr tokens len>2
-    objs: list[str] = []
-    for t in tokens:
-        if t in colors or t in sizes or len(t) <= 2:
-            continue
-        if t not in objs:
-            objs.append(t)
-
-    qs: list[str] = []
-
-    # object presence
-    for o in objs[:5]:
-        qs.append(f"Is there a {o}?")
-
-    # attribute association to nearest following token
-    for i, t in enumerate(tokens):
-        if t in colors or t in sizes:
-            nearest: str | None = None
-            for j in range(i + 1, min(i + 4, len(tokens))):
-                if tokens[j] not in colors and tokens[j] not in sizes and len(tokens[j]) > 2:
-                    nearest = tokens[j]
-                    break
-            if nearest:
-                qs.append(f"Is the {nearest} {t}?")
-
-    # relation hints (very rough)
-    toks = set(tokens)
-    if "left" in toks and "right" in toks:
-        qs.append("Is one object to the left of another object?")
-    if "on" in toks:
-        qs.append("Is one object on top of another object?")
-    if "under" in toks:
-        qs.append("Is one object under another object?")
-    if "front" in toks and "behind" in toks:
-        qs.append("Is one object in front of another object?")
-
-    # unique & cap
-    qs = list(dict.fromkeys(qs))
-    return qs[:limit]
-

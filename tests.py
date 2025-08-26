@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import importlib
 
 import numpy as np
 import pytest
@@ -19,9 +18,9 @@ RUN_INTEGRATION = os.environ.get("RUN_HF_INTEGRATION", "1") == "1"
 
 def _hf_available() -> bool:
     try:
-        import transformers  # noqa: F401
-        import sentence_transformers  # noqa: F401
-        import torch  # noqa: F401
+        import transformers
+        import sentence_transformers
+        import torch
         return True
     except Exception:
         return False
@@ -93,16 +92,16 @@ def test_embedding_interface(matcher: TextImageMatcher, red_image: Path):
 @skip_no_hf
 def test_captioner_interface(matcher: TextImageMatcher, red_image: Path):
     img = PILImage.open(red_image).convert("RGB")
-    cap = matcher.captioner.caption(img)  # type: ignore[union-attr]
+    cap = matcher.captioner.caption(img)
     assert isinstance(cap, str) and len(cap.strip()) > 0
 
 
 @skip_no_run
 @skip_no_hf
 def test_sts_interface(matcher: TextImageMatcher):
-    sim_same = matcher.sts_model.similarity("a red square", "a red square")  # type: ignore[union-attr]
-    sim_diff = matcher.sts_model.similarity("a red square", "a blue circle")  # type: ignore[union-attr]
-    # Basic sanity: identical vs different should not be inverted
+    sim_same = matcher.sts_model.similarity("a red square", "a red square")
+    sim_diff = matcher.sts_model.similarity("a red square", "a blue circle")
+    # Basic sanity
     assert sim_same >= sim_diff
 
 
@@ -110,16 +109,16 @@ def test_sts_interface(matcher: TextImageMatcher):
 @skip_no_hf
 def test_grounding_interface(matcher: TextImageMatcher, red_image: Path):
     img = PILImage.open(red_image).convert("RGB")
-    dets = matcher.grounding_model.detect(img, targets=["square", "red object"])  # type: ignore[union-attr]
+    dets = matcher.grounding_model.detect(img, targets=["square", "red object"])
     assert isinstance(dets, dict)
-    # do not assert specific keys; some models may return empty results on synthetic images
+    # no specific keys; some models may return empty results on synthetic images
 
 
 @skip_no_run
 @skip_no_hf
 def test_vqa_interface(matcher: TextImageMatcher, red_image: Path):
     img = PILImage.open(red_image).convert("RGB")
-    p = matcher.vqa_model.yesno_prob(img, "Is it red?")  # type: ignore[union-attr]
+    p = matcher.vqa_model.yesno_prob(img, "Is it red?")
     assert isinstance(p, float) and 0.0 <= p <= 1.0
 
 
@@ -128,7 +127,7 @@ def test_vqa_interface(matcher: TextImageMatcher, red_image: Path):
 def test_score_all_smoke(matcher: TextImageMatcher, red_image: Path):
     scores = matcher.score_all(str(red_image), "a red square")
     assert set(scores.keys()) == {"embedding", "caption_compare", "grounded", "vqa", "aggregate"}
-    for k, v in scores.items():
+    for v in scores.values():
         assert isinstance(v, float)
         assert 0.0 <= v <= 1.0
 

@@ -16,7 +16,7 @@ models:
     target: "matcher:HFCLIPAdapter"
     init:
       model_name: "openai/clip-vit-base-patch32"
-      device: "cuda"                # CLIP adapter will .to("cuda")
+      device: "cuda"
 
   captioner:
     target: "transformers:pipeline"
@@ -25,13 +25,19 @@ models:
       model: "Salesforce/blip-image-captioning-base"
       device_map: "auto"            # or: device: 0
       torch_dtype: "auto"
-      # model_kwargs: { use_safetensors: true }   # optional, recommended
+      # model_kwargs: { use_safetensors: true }   # optional, torch < 2.6
+    wrapper:
+      target: "matcher:CaptionCallableWrapper"
+      init: { key: generated_text }
 
   sts:
     target: "sentence_transformers:SentenceTransformer"
     init:
       model_name_or_path: "all-MiniLM-L6-v2"
       device: "cuda"                # ensures encode runs on GPU
+    wrapper:
+      target: "matcher:SBERTLikeSTSWrapper"
+      init: { encode_method: encode }
 
   grounding:
     target: "transformers:pipeline"
@@ -40,6 +46,8 @@ models:
       model: "google/owlvit-base-patch32"
       device_map: "auto"            # or device: 0
       torch_dtype: "auto"
+    wrapper:
+      target: "matcher:HFZeroShotDetAdapter"
 
   vqa:
     target: "transformers:pipeline"
@@ -48,3 +56,18 @@ models:
       model: "dandelin/vilt-b32-finetuned-vqa"
       device_map: "auto"            # or device: 0
       torch_dtype: "auto"
+    wrapper:
+      target: "matcher:HFVQAPipelineAdapter"
+
+  qg:
+    backend: t5
+    max_questions: 12
+    t5:
+      target: transformers:pipeline
+      init:
+        task: text2text-generation
+        # pick one of these:
+        # model: "valhalla/t5-small-qg-hl"     # QG-tuned, lightweight
+        model: "google/flan-t5-base"          # strong general model
+        device_map: "auto"
+        torch_dtype: "auto"

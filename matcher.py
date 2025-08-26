@@ -1,24 +1,29 @@
+# matcher.py — full replacement with pluggable QG (question generation)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable, TypedDict, Any, Mapping
+import click
 import importlib
-import csv as _csv
+import csv
 import json as _json
-
+import numpy as np
 import yaml 
 
 from utils import (
     PILImage, Embedding,
     cosine, sigmoid, soft_f1,
     simple_tokenize, string_similarity, pairwise_best_match,
-    generate_vqa_questions,
+    url_to_local_png
 )
 
+from qg_backends import QGBackend, T5QGAdapter
+
 # ==========================
-# Protocols (pluggable APIs)
+# Types & Protocols
 # ==========================
+
 
 @runtime_checkable
 class EmbeddingModel(Protocol):
@@ -33,7 +38,6 @@ class Captioner(Protocol):
 
 @runtime_checkable
 class STSModel(Protocol):
-    """Semantic textual similarity."""
     def similarity(self, a: str, b: str) -> float: ...
 
 
@@ -54,233 +58,28 @@ class VQAModel(Protocol):
 
 
 # ==========================
-# YAML-driven model builders + default adapters
+# Default model specs (override via YAML models: block)
 # ==========================
-
-def _load_dotted(path: str) -> Any:
-    """Load an object from a dotted path like 'module.sub:Attr' or 'module.sub.Attr'."""
-    if ":" in path:
-        mod_name, attr = path.split(":", 1)
-    else:
-        parts = path.rsplit(".", 1)
-        mod_name, attr = (parts[0], parts[1]) if len(parts) == 2 else (path, None)
-    module = importlib.import_module(mod_name)
-    return getattr(module, attr) if attr else module
-
-
-def _instantiate(target: Any, kwargs: dict[str, Any] | None = None) -> Any:
-    kwargs = dict(kwargs or {})
-    if callable(target):
-        return target(**kwargs)
-    raise TypeError(f"Target {target!r} is not callable for instantiation")
-
-
-def _has_methods(obj: Any, *methods: str) -> bool:
-    return all(callable(getattr(obj, m, None)) for m in methods)
-
-
-# ---- Lightweight default adapters (used if wrapper not provided and methods missing)
-class _CLIPLikeWrapper:
-    def __init__(self, model: Any, image_method: str = "encode_image", text_method: str = "encode_text") -> None:
-        self.m = model
-        self.imethod = image_method
-        self.tmethod = text_method
-    def encode_image(self, image: PILImage.Image):
-        fn = getattr(self.m, self.imethod)
-        return fn(image)
-    def encode_text(self, text: str):
-        fn = getattr(self.m, self.tmethod)
-        return fn(text)
-
-class _CaptionCallableWrapper:
-    def __init__(self, model: Any, method: str = "__call__", key: str | None = None) -> None:
-        self.m = model
-        self.method = method
-        self.key = key
-    def caption(self, image: PILImage.Image) -> str:
-        if self.method == "__call__":
-            out = self.m(image)
-        else:
-            out = getattr(self.m, self.method)(image)
-        if isinstance(out, str):
-            return out
-        if self.key is not None and isinstance(out, (list, dict)):
-            if isinstance(out, list) and out:
-                first = out[0]
-                if isinstance(first, dict) and self.key in first:
-                    return str(first[self.key])
-            if isinstance(out, dict) and self.key in out:
-                return str(out[self.key])
-        return str(out)
-
-class _SBERTLikeSTSWrapper:
-    def __init__(self, model: Any, encode_method: str = "encode") -> None:
-        self.m = model
-        self.encode_method = encode_method
-    def similarity(self, a: str, b: str) -> float:
-        import numpy as np
-        enc = getattr(self.m, self.encode_method)
-        v = enc([a, b])
-        va, vb = np.asarray(v[0]), np.asarray(v[1])
-        va = va / (np.linalg.norm(va) + 1e-9)
-        vb = vb / (np.linalg.norm(vb) + 1e-9)
-        return float(np.dot(va, vb))
-
-class _GroundingForwardWrapper:
-    def __init__(self, model: Any, method: str = "detect", extra: dict[str, Any] | None = None) -> None:
-        self.m = model
-        self.method = method
-        self.extra = dict(extra or {})
-    def detect(self, image: PILImage.Image, targets: list[str]):
-        fn = getattr(self.m, self.method)
-        return fn(image, targets=targets, **self.extra)
-
-class _YesNoVQAWrapper:
-    def __init__(self, model: Any, method: str = "__call__", yes_key: str = "yes", no_key: str = "no") -> None:
-        self.m = model
-        self.method = method
-        self.yes_key = yes_key
-        self.no_key = no_key
-    def yesno_prob(self, image: PILImage.Image, question: str) -> float:
-        if self.method == "__call__":
-            out = self.m(image=image, question=question)
-        else:
-            out = getattr(self.m, self.method)(image=image, question=question)
-        if isinstance(out, (int, float)):
-            return float(out)
-        if isinstance(out, str):
-            t = out.strip().lower()
-            if t in {"yes", "y", "true"}: return 1.0
-            if t in {"no", "n", "false"}: return 0.0
-            return 0.5
-        if isinstance(out, dict):
-            if self.yes_key in out and isinstance(out[self.yes_key], (int, float)):
-                return float(out[self.yes_key])
-            if self.no_key in out and isinstance(out[self.no_key], (int, float)):
-                return 1.0 - float(out[self.no_key])
-        # HF VQA pipeline results handled by HF adapter below
-        return 0.5
-
-# ---- HuggingFace-specific adapters (top-level so they are importable via dotted path)
-class HFCLIPAdapter:
-    """Self-contained CLIP encoder using transformers (requires torch).
-    Provides encode_image / encode_text producing numpy arrays.
-    """
-    def __init__(self, model_name: str = "openai/clip-vit-base-patch32", device: str | None = None) -> None:
-        from transformers import CLIPProcessor, CLIPModel
-        import torch
-        self.processor = CLIPProcessor.from_pretrained(model_name)
-        self.model = CLIPModel.from_pretrained(model_name)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device).eval()
-        self._torch = torch
-    def encode_image(self, image: PILImage.Image) -> Embedding:
-        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-        with self._torch.no_grad():
-            feats = self.model.get_image_features(**inputs)
-        return feats[0].detach().cpu().numpy()
-    def encode_text(self, text: str) -> Embedding:
-        inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True).to(self.device)
-        with self._torch.no_grad():
-            feats = self.model.get_text_features(**inputs)
-        return feats[0].detach().cpu().numpy()
-
-class HFVQAPipelineAdapter:
-    """Adapter over HF 'visual-question-answering' pipeline.
-    Maps answers 'yes'/'no' with associated score into a probability.
-    """
-    def __init__(self, model: Any) -> None:
-        self.pipe = model
-    def yesno_prob(self, image: PILImage.Image, question: str) -> float:
-        out = self.pipe(image=image, question=question)
-        item = out[0] if isinstance(out, list) and out else (out if isinstance(out, dict) else None)
-        if not isinstance(item, dict):
-            return 0.5
-        ans = str(item.get("answer", "")).strip().lower()
-        score = float(item.get("score", 0.5))
-        if ans in {"yes", "y", "true"}:
-            return score
-        if ans in {"no", "n", "false"}:
-            return 1.0 - score
-        return 0.5
-
-class HFZeroShotDetAdapter:
-    """Adapter over HF 'zero-shot-object-detection' pipeline (e.g., OWL-ViT).
-    Returns mapping target -> list[Detection-like dict].
-    """
-    def __init__(self, model: Any) -> None:
-        self.pipe = model
-    def detect(self, image: PILImage.Image, targets: list[str]):
-        if not targets:
-            return {}
-        results = self.pipe(image, candidate_labels=targets)
-        items = results if isinstance(results, list) else [results]
-        out: dict[str, list[dict[str, Any]]] = {}
-        for d in items:
-            lbl = str(d.get("label", ""))
-            if not lbl:
-                continue
-            box = d.get("box", {})
-            bbox = (
-                float(box.get("xmin", box.get("x1", 0.0))),
-                float(box.get("ymin", box.get("y1", 0.0))),
-                float(box.get("xmax", box.get("x2", 0.0))),
-                float(box.get("ymax", box.get("y2", 0.0))),
-            )
-            out.setdefault(lbl, []).append({"score": float(d.get("score", 0.0)), "bbox": bbox, "attributes": []})
-        return out
-
-
-def _build_model_from_spec(spec: Mapping[str, Any] | None) -> Any | None:
-    if not spec:
-        return None
-    if not isinstance(spec, Mapping):
-        raise TypeError("Model spec must be a mapping")
-    target_path = spec.get("target")
-    if not target_path:
-        return None
-    ctor = _load_dotted(str(target_path))
-    base = _instantiate(ctor, dict(spec.get("init", {})))
-    wrapper_spec = spec.get("wrapper")
-    if not wrapper_spec:
-        return base
-    if isinstance(wrapper_spec, str):
-        wrap_ctor = _load_dotted(wrapper_spec)
-        wrap_kwargs: dict[str, Any] = {"model": base}
-    elif isinstance(wrapper_spec, Mapping):
-        wrap_ctor = _load_dotted(str(wrapper_spec.get("target")))
-        wrap_kwargs = dict(wrapper_spec.get("init", {}))
-        wrap_kwargs.setdefault("model", base)
-    else:
-        raise TypeError("wrapper must be a string or mapping")
-    return _instantiate(wrap_ctor, wrap_kwargs)
-
-# Popular default model specs (can be overridden in YAML)
-DEFAULT_MODEL_SPECS: dict[str, Mapping[str, Any]] = {
-    # Embedding via CLIP (transformers)
+DEFAULT_MODEL_SPECS: dict[str, Any] = {
     "embedding": {
         "target": "matcher:HFCLIPAdapter",
         "init": {"model_name": "openai/clip-vit-base-patch32"},
     },
-    # Captioning via BLIP (transformers pipeline)
     "captioner": {
         "target": "transformers:pipeline",
         "init": {"task": "image-to-text", "model": "Salesforce/blip-image-captioning-large"},
-        "wrapper": {"target": "matcher:_CaptionCallableWrapper", "init": {"method": "__call__", "key": "generated_text"}},
+        "wrapper": {"target": "matcher:CaptionCallableWrapper", "init": {"key": "generated_text"}},
     },
-    # STS via Sentence-Transformers
     "sts": {
         "target": "sentence_transformers:SentenceTransformer",
         "init": {"model_name_or_path": "all-mpnet-base-v2"},
-        "wrapper": {"target": "matcher:_SBERTLikeSTSWrapper", "init": {"encode_method": "encode"}},
+        "wrapper": {"target": "matcher:SBERTLikeSTSWrapper", "init": {"encode_method": "encode"}},
     },
-    # Grounding via OWL-ViT zero-shot detector
     "grounding": {
         "target": "transformers:pipeline",
         "init": {"task": "zero-shot-object-detection", "model": "google/owlvit-base-patch32"},
         "wrapper": {"target": "matcher:HFZeroShotDetAdapter"},
     },
-    # VQA via ViLT/BLIP VQA pipeline
     "vqa": {
         "target": "transformers:pipeline",
         "init": {"task": "visual-question-answering", "model": "dandelin/vilt-b32-finetuned-vqa"},
@@ -288,21 +87,21 @@ DEFAULT_MODEL_SPECS: dict[str, Mapping[str, Any]] = {
     },
 }
 
-# ==============
-# Config objects
-# ==============
 
+# ==========================
+# Config
+# ==========================
 @dataclass(slots=True)
 class Weights:
-    alpha_embed: float = 0.4   # joint-embedding
-    beta_caption: float = 0.2  # caption-then-compare
-    gamma_ground: float = 0.2  # grounded coverage
-    delta_vqa: float = 0.2     # VQA compliance
+    alpha_embed: float = 0.4
+    beta_caption: float = 0.2
+    gamma_ground: float = 0.2
+    delta_vqa: float = 0.2
 
 
 @dataclass(slots=True)
 class Calibration:
-    num_random_negatives: int = 16  # (hook for your sampler if you add one)
+    num_random_negatives: int = 16
 
 
 @dataclass(slots=True)
@@ -313,30 +112,27 @@ class MatcherConfig:
     ground_attr_w: float = 0.3
     ground_rel_w: float = 0.2
     str_sim_threshold: float = 0.6
+    qg_max_questions: int = 12
 
-    # -------- YAML helpers --------
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "MatcherConfig":
-        # weights
-        w = data.get("weights", {})
+        w = data.get("weights", {}) or {}
         weights = Weights(
             alpha_embed=float(w.get("alpha_embed", 0.4)),
             beta_caption=float(w.get("beta_caption", 0.2)),
             gamma_ground=float(w.get("gamma_ground", 0.2)),
             delta_vqa=float(w.get("delta_vqa", 0.2)),
         )
-        # calibration
-        c = data.get("calibration", {})
-        calibration = Calibration(
-            num_random_negatives=int(c.get("num_random_negatives", 16))
-        )
-        # grounded weights (support both flat keys and nested group)
-        gw = data.get("grounded_weights", {})
+        c = data.get("calibration", {}) or {}
+        calibration = Calibration(num_random_negatives=int(c.get("num_random_negatives", 16)))
+
+        gw = data.get("grounded_weights", {}) or {}
         ground_entity_w = float(data.get("ground_entity_w", gw.get("entity", 0.5)))
-        ground_attr_w   = float(data.get("ground_attr_w",   gw.get("attribute", 0.3)))
-        ground_rel_w    = float(data.get("ground_rel_w",    gw.get("relation", 0.2)))
+        ground_attr_w = float(data.get("ground_attr_w", gw.get("attribute", 0.3)))
+        ground_rel_w = float(data.get("ground_rel_w", gw.get("relation", 0.2)))
 
         str_sim_threshold = float(data.get("str_sim_threshold", 0.6))
+        qg_max_questions = int(data.get("qg_max_questions", data.get("qg", {}).get("max_questions", 12)))
 
         return cls(
             weights=weights,
@@ -345,47 +141,224 @@ class MatcherConfig:
             ground_attr_w=ground_attr_w,
             ground_rel_w=ground_rel_w,
             str_sim_threshold=str_sim_threshold,
+            qg_max_questions=qg_max_questions,
         )
 
-    @classmethod
-    def from_yaml_file(cls, path: str | Path) -> "MatcherConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        if not isinstance(raw, Mapping):
-            raise ValueError("Config YAML must be a mapping at the top level.")
-        return cls.from_mapping(raw)
+
+# ==========================
+# Wrappers / Adapters
+# ==========================
+class CLIPLikeWrapper:
+    def __init__(self, model: Any, image_method: str = "encode_image", text_method: str = "encode_text") -> None:
+        self.model = model
+        self._img_m = image_method
+        self._txt_m = text_method
+
+    def encode_image(self, image: PILImage.Image) -> Embedding:
+        return getattr(self.model, self._img_m)(image)
+
+    def encode_text(self, text: str) -> Embedding:
+        return getattr(self.model, self._txt_m)(text)
 
 
-# ===========
-# Main class
-# ===========
+class CaptionCallableWrapper:
+    def __init__(self, model: Any, method: str = "__call__", key: str | None = None) -> None:
+        self.model = model
+        self.method = method
+        self.key = key
 
+    def caption(self, image: PILImage.Image) -> str:
+        fn = getattr(self.model, self.method)
+        out = fn(image)
+        if isinstance(out, str):
+            return out
+        if isinstance(out, list) and out and isinstance(out[0], dict) and self.key:
+            return str(out[0].get(self.key, "")).strip()
+        if isinstance(out, dict) and self.key:
+            return str(out.get(self.key, "")).strip()
+        # last resort
+        return str(out)
+
+
+class SBERTLikeSTSWrapper:
+    def __init__(self, model: Any, encode_method: str = "encode") -> None:
+        self.model = model
+        self.encode_method = encode_method
+
+    def similarity(self, a: str, b: str) -> float:
+        enc = getattr(self.model, self.encode_method)
+        va, vb = enc([a, b])
+        va = np.asarray(va, dtype=np.float32)
+        vb = np.asarray(vb, dtype=np.float32)
+        s = cosine(va, vb)
+        return s if 0.0 <= s <= 1.0 else 0.5 * (s + 1.0)
+
+
+class _GroundingForwardWrapper:
+    def __init__(self, model: Any) -> None:
+        self.model = model
+
+    def detect(self, image: PILImage.Image, targets: list[str]) -> dict[str, list[Detection]]:
+        # Try HF zero-shot detection pipeline signature
+        try:
+            out = self.model(image, candidate_labels=targets)
+        except TypeError:
+            out = self.model.detect(image, targets=targets)
+        # Normalize
+        det_map: dict[str, list[Detection]] = {t: [] for t in targets}
+        if isinstance(out, list):
+            for d in out:
+                lbl = str(d.get("label", ""))
+                box = d.get("box", {}) or {}
+                bbox = (
+                    float(box.get("xmin") or box.get("x1") or 0.0),
+                    float(box.get("ymin") or box.get("y1") or 0.0),
+                    float(box.get("xmax") or box.get("x2") or 0.0),
+                    float(box.get("ymax") or box.get("y2") or 0.0),
+                )
+                sc = float(d.get("score", 0.0))
+                if lbl in det_map:
+                    det_map[lbl].append({"score": sc, "bbox": bbox})
+        elif isinstance(out, dict):
+            det_map = out  # assume already normalized
+        return det_map
+
+
+class YesNoVQAWrapper:
+    def __init__(self, model: Any) -> None:
+        self.model = model
+
+    def yesno_prob(self, image: PILImage.Image, question: str) -> float:
+        try:
+            out = self.model(image=image, question=question)
+        except TypeError:
+            out = self.model(question=question, image=image)
+        # Interpret outputs
+        if isinstance(out, (int, float)):
+            p = float(out)
+            return max(0.0, min(1.0, p))
+        if isinstance(out, str):
+            s = out.strip().lower()
+            if s in {"yes", "true"}: return 1.0
+            if s in {"no", "false"}:  return 0.0
+            return 0.5
+        if isinstance(out, dict):
+            if "answer" in out and "score" in out:
+                ans = str(out["answer"]).strip().lower()
+                sc = float(out["score"])
+                return sc if ans in {"yes", "true"} else (1.0 - sc)
+            # maybe a {"no": 0.2, "yes": 0.8}
+            if "yes" in out or "no" in out:
+                py = float(out.get("yes", 0.0))
+                pn = float(out.get("no", 0.0))
+                s = py / (py + pn) if (py + pn) > 1e-8 else 0.5
+                return max(0.0, min(1.0, s))
+        return 0.5
+
+
+# HF-specific light adapters (used by defaults)
+class HFVQAPipelineAdapter:
+    def __init__(self, pipe: Any) -> None:
+        self.pipe = pipe
+
+    def yesno_prob(self, image: PILImage.Image, question: str) -> float:
+        out = self.pipe(image=image, question=question)
+        if isinstance(out, list):
+            out = out[0]
+        if isinstance(out, dict) and {"answer", "score"} <= out.keys():
+            ans = str(out["answer"]).strip().lower()
+            sc = float(out["score"]) if np.isfinite(out.get("score", 0.0)) else 0.5
+            return sc if ans in {"yes", "true"} else (1.0 - sc)
+        return 0.5
+
+
+class HFZeroShotDetAdapter:
+    def __init__(self, pipe: Any) -> None:
+        self.pipe = pipe
+
+    def detect(self, image: PILImage.Image, targets: list[str]) -> dict[str, list[Detection]]:
+        res = self.pipe(image, candidate_labels=targets)
+        det_map: dict[str, list[Detection]] = {t: [] for t in targets}
+        for r in res:
+            lbl = str(r.get("label", ""))
+            box = r.get("box", {}) or {}
+            bbox = (
+                float(box.get("xmin") or box.get("x1") or 0.0),
+                float(box.get("ymin") or box.get("y1") or 0.0),
+                float(box.get("xmax") or box.get("x2") or 0.0),
+                float(box.get("ymax") or box.get("y2") or 0.0),
+            )
+            sc = float(r.get("score", 0.0))
+            if lbl in det_map:
+                det_map[lbl].append({"score": sc, "bbox": bbox})
+        return det_map
+
+
+class HFCLIPAdapter:
+    """Minimal CLIP adapter (Transformers)."""
+    def __init__(self, model_name: str = "openai/clip-vit-base-patch32", device: str | None = None, model_kwargs: dict | None = None) -> None:
+        from transformers import CLIPProcessor, CLIPModel
+        import torch
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model = CLIPModel.from_pretrained(model_name, **(model_kwargs or {}))
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device).eval()
+        self._torch = torch
+
+    def encode_image(self, image: PILImage.Image) -> Embedding:
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        with self._torch.no_grad():
+            v = self.model.get_image_features(**inputs)
+        return v.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+    def encode_text(self, text: str) -> Embedding:
+        inputs = self.processor(text=[text], return_tensors="pt", truncation=True).to(self.device)
+        with self._torch.no_grad():
+            v = self.model.get_text_features(**inputs)
+        return v.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+
+# ==========================
+# YAML helpers
+# ==========================
+
+def _load_dotted(target: str) -> Any:
+    """Import a dotted object path like 'module:Symbol' or 'module.symbol'."""
+    if ":" in target:
+        mod, sym = target.split(":", 1)
+    else:
+        mod, sym = target.rsplit(".", 1)
+    m = importlib.import_module(mod)
+    return getattr(m, sym)
+
+
+def _has_methods(obj: Any, *methods: str) -> bool:
+    return all(hasattr(obj, m) for m in methods)
+
+
+def _build_model_from_spec(spec: Mapping[str, Any]) -> Any:
+    if not isinstance(spec, Mapping) or "target" not in spec:
+        return None
+    target = _load_dotted(str(spec["target"]))
+    init = spec.get("init", {}) or {}
+    base = target(**init) if callable(target) else target
+
+    wrapper = spec.get("wrapper")
+    if isinstance(wrapper, Mapping) and "target" in wrapper:
+        w_cls = _load_dotted(str(wrapper["target"]))
+        w_init = wrapper.get("init", {}) or {}
+        # try common conventions
+        try:
+            return w_cls(base, **w_init)
+        except TypeError:
+            return w_cls(model=base, **w_init)
+    return base
+
+
+# ==========================
+# Main matcher class
+# ==========================
 class TextImageMatcher:
-    """
-    Model-agnostic text–image match scorer with four components:
-      (1) joint-embedding similarity
-      (2) caption-then-compare
-      (3) grounded concept coverage
-      (4) VQA compliance
-
-    YAML configuration schema (excerpt):
-    ---
-    weights:
-      alpha_embed: 0.45
-      beta_caption: 0.2
-      gamma_ground: 0.2
-      delta_vqa: 0.15
-    calibration:
-      num_random_negatives: 16
-    grounded_weights:
-      entity: 0.5
-      attribute: 0.3
-      relation: 0.2
-    str_sim_threshold: 0.6
-
-    models:  # any missing entries fall back to built-in DEFAULT_MODEL_SPECS
-    """
-
     def __init__(
         self,
         config: MatcherConfig | None = None,
@@ -395,6 +368,7 @@ class TextImageMatcher:
         sts_model: STSModel | None = None,
         grounding_model: GroundingModel | None = None,
         vqa_model: VQAModel | None = None,
+        qg_backend: QGBackend | None = None,
     ) -> None:
         self.cfg = config or MatcherConfig()
         self.embed_model = embed_model
@@ -402,8 +376,9 @@ class TextImageMatcher:
         self.sts_model = sts_model
         self.grounding_model = grounding_model
         self.vqa_model = vqa_model
+        self.qg = qg_backend
 
-    # ---- Constructors from YAML ----
+    # ---- YAML constructor ----
     @classmethod
     def from_yaml(
         cls,
@@ -414,6 +389,7 @@ class TextImageMatcher:
         sts_model: STSModel | None = None,
         grounding_model: GroundingModel | None = None,
         vqa_model: VQAModel | None = None,
+        qg_backend: QGBackend | None = None,
     ) -> "TextImageMatcher":
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
@@ -422,7 +398,7 @@ class TextImageMatcher:
 
         cfg = MatcherConfig.from_mapping(raw)
 
-        # Build models from YAML specs, filling in defaults where missing
+        # Build model specs (defaults + user overrides)
         specs: dict[str, Any] = dict(DEFAULT_MODEL_SPECS)
         user_specs = raw.get("models", {})
         if isinstance(user_specs, Mapping):
@@ -439,11 +415,25 @@ class TextImageMatcher:
                 return obj
             return default_wrapper(obj)
 
-        built_embed = _build("embedding", ("encode_image", "encode_text"), _CLIPLikeWrapper)
-        built_caption = _build("captioner", ("caption",), _CaptionCallableWrapper)
-        built_sts = _build("sts", ("similarity",), _SBERTLikeSTSWrapper)
+        built_embed = _build("embedding", ("encode_image", "encode_text"), CLIPLikeWrapper)
+        built_caption = _build("captioner", ("caption",), CaptionCallableWrapper)
+        built_sts = _build("sts", ("similarity",), SBERTLikeSTSWrapper)
         built_ground = _build("grounding", ("detect",), _GroundingForwardWrapper)
-        built_vqa = _build("vqa", ("yesno_prob",), _YesNoVQAWrapper)
+        built_vqa = _build("vqa", ("yesno_prob",), YesNoVQAWrapper)
+
+        # QG backend
+        if qg_backend is None:
+            qg_cfg = raw.get("qg", {}) if isinstance(raw, Mapping) else {}
+            backend = (qg_cfg.get("backend") if isinstance(qg_cfg, Mapping) else None) or "builtin"
+            if backend == "t5":
+                t5_spec = qg_cfg.get("t5") if isinstance(qg_cfg, Mapping) else None
+                if not isinstance(t5_spec, Mapping):
+                    t5_spec = {
+                        "target": "transformers:pipeline",
+                        "init": {"task": "text2text-generation", "model": "google/flan-t5-base"},
+                    }
+                t5_pipe = _build_model_from_spec(t5_spec)
+                qg_backend = T5QGAdapter(t5_pipe)
 
         return cls(
             config=cfg,
@@ -452,46 +442,40 @@ class TextImageMatcher:
             sts_model=sts_model or built_sts,
             grounding_model=grounding_model or built_ground,
             vqa_model=vqa_model or built_vqa,
+            qg_backend=qg_backend,
         )
 
     # ---- Data I/O ----
-
-    def read_csv(
-        self,
-        csv_path: str | Path,
-        *,
-        image_col: str = "image",
-        text_col: str = "text",
-    ) -> list[dict[str, str]]:
+    def read_csv(self, csv_path: str | Path, *, image_col: str = "image", text_col: str = "text") -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
+            reader = csv.DictReader(f)
             if not reader.fieldnames or image_col not in reader.fieldnames or text_col not in reader.fieldnames:
                 raise ValueError(f"CSV must contain columns '{image_col}' and '{text_col}'")
             for r in reader:
-                img = r.get(image_col, "")
+                img = r.get(image_col, "").strip()
                 txt = r.get(text_col, "")
                 if not img:
                     continue
+                img = f"{Path(csv_path).parent}/{url_to_local_png(img)}"
                 rows.append({"image": img, "text": txt})
         return rows
 
     def _load_image(self, path_or_img: str | Path | PILImage.Image) -> PILImage.Image:
-        if hasattr(path_or_img, "convert"):  # already PIL image
+        if hasattr(path_or_img, "convert"):
             return path_or_img  # type: ignore[return-value]
-        p = Path(path_or_img)  # type: ignore[arg-type]
+        p = Path(path_or_img)
         if not p.exists():
             raise FileNotFoundError(str(p))
-        return PILImage.open(p).convert("RGB")  # type: ignore[return-value]
+        return PILImage.open(p).convert("RGB")
 
     # ---- (1) Joint-embedding ----
-
     def score_embedding(
         self,
         image: str | Path | PILImage.Image,
         text: str,
         *,
-        negative_texts: list[str] | None = None,
+        negative_texts: Sequence[str] | None = None,
     ) -> float:
         if self.embed_model is None:
             base = Path(image).name if not hasattr(image, "convert") else "image"
@@ -507,21 +491,32 @@ class TextImageMatcher:
             mu = (sum(neg) / len(neg)) if neg else 0.0
             sd = (sum((x - mu) ** 2 for x in neg) / max(1, (len(neg) - 1))) ** 0.5 if len(neg) > 1 else 1.0
             z = (s - mu) / (sd or 1e-6)
-            return sigmoid(z)  # [0,1]
+            return sigmoid(z)
         return 0.5 * (s + 1.0)
 
     # ---- (2) Caption-then-compare ----
-
     def score_caption_compare(self, image: str | Path | PILImage.Image, text: str) -> float:
         if self.captioner is None or self.sts_model is None:
             return string_similarity(text, "an image")
         img = self._load_image(image)
         hatT = self.captioner.caption(img)
+        if not isinstance(hatT, str):
+            if isinstance(hatT, list) and hatT and isinstance(hatT[0], dict):
+                hatT = str(hatT[0].get("generated_text")
+                           or hatT[0].get("caption")
+                           or hatT[0].get("text")
+                           or hatT)
+            elif isinstance(hatT, dict):
+                hatT = str(hatT.get("generated_text")
+                           or hatT.get("caption")
+                           or hatT.get("text")
+                           or hatT)
+            else:
+                hatT = str(hatT)
         sim = self.sts_model.similarity(text, hatT)
         return sim if 0.0 <= sim <= 1.0 else 0.5 * (sim + 1.0)
 
     # ---- (3) Grounded coverage ----
-
     def _extract_targets(self, text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
         tokens = simple_tokenize(text)
         colors = {
@@ -551,7 +546,7 @@ class TextImageMatcher:
         if self.grounding_model is None:
             base_tokens: list[str] = []
             if not hasattr(image, "convert"):
-                base_tokens = simple_tokenize(Path(image).name)  # type: ignore[arg-type]
+                base_tokens = simple_tokenize(Path(image).name)
             match_e, tot_e = pairwise_best_match(ents_T, base_tokens, self.cfg.str_sim_threshold)
             prec_e = match_e / max(1, len(base_tokens))
             rec_e = match_e / max(1, tot_e)
@@ -592,7 +587,6 @@ class TextImageMatcher:
                 prec=attr_hits / max(1, len(attrs_T)),
                 rec=attr_hits / max(1, len(attrs_T)),
             )
-
             f1_r = 1.0 if len(ents_T) >= 2 and det_map else 0.0
 
         wE, wA, wR = self.cfg.ground_entity_w, self.cfg.ground_attr_w, self.cfg.ground_rel_w
@@ -600,15 +594,22 @@ class TextImageMatcher:
         return (wE * f1_e + wA * f1_a + wR * f1_r) / denom
 
     # ---- (4) VQA compliance ----
-
     def score_vqa_compliance(
         self,
         image: str | Path | PILImage.Image,
         text: str,
         *,
-        questions: list[str] | None = None,
+        questions: Sequence[str] | None = None,
     ) -> float:
-        qs = list(questions) if questions else generate_vqa_questions(text)
+        if questions:
+            qs = list(questions)
+        else:
+            limit = getattr(self.cfg, "qg_max_questions", 12)
+            if getattr(self, "qg", None) is not None:
+                qs = self.qg.generate(text, limit=limit)  # type: ignore[union-attr]
+            else:
+                # ultra-minimal fallback in case no QG backend is set
+                qs = [f"Is there {w}?" for w in simple_tokenize(text)][:limit] or ["Is something visible?"]
         if not qs:
             return 0.0
 
@@ -621,14 +622,13 @@ class TextImageMatcher:
         return sum(probs) / len(probs)
 
     # ---- Composite ----
-
     def score_all(
         self,
         image: str | Path | PILImage.Image,
         text: str,
         *,
-        negative_texts: list[str] | None = None,
-        vqa_questions: list[str] | None = None,
+        negative_texts: Sequence[str] | None = None,
+        vqa_questions: Sequence[str] | None = None,
     ) -> dict[str, float]:
         s_embed = self.score_embedding(image, text, negative_texts=negative_texts)
         s_cap = self.score_caption_compare(image, text)
@@ -637,52 +637,36 @@ class TextImageMatcher:
 
         w = self.cfg.weights
         total = max(1e-8, w.alpha_embed + w.beta_caption + w.gamma_ground + w.delta_vqa)
-        agg = (w.alpha_embed * s_embed +
-               w.beta_caption * s_cap +
-               w.gamma_ground * s_grd +
-               w.delta_vqa * s_vqa) / total
-
-        return {
-            "embedding": s_embed,
-            "caption_compare": s_cap,
-            "grounded": s_grd,
-            "vqa": s_vqa,
-            "aggregate": agg,
-        }
-
-# ======================
-# CLI (Click) for batch scoring
-# ======================
-
-import click
+        agg = (w.alpha_embed * s_embed + w.beta_caption * s_cap + w.gamma_ground * s_grd + w.delta_vqa * s_vqa) / total
+        return {"embedding": s_embed, "caption_compare": s_cap, "grounded": s_grd, "vqa": s_vqa, "aggregate": agg}
 
 
+# ==========================
+# CLI (Click)
+# ==========================
 @click.command(context_settings={"show_default": True})
-@click.option("--config", "config_path", required=True, type=click.Path(exists=True, dir_okay=False),
-              help="Path to YAML config (models + weights)")
-@click.option("--csv", "csv_path", required=True, type=click.Path(exists=True, dir_okay=False),
-              help="CSV with image/text columns")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, dir_okay=False), help="Path to YAML config (models + weights)")
+@click.option("--csv", "csv_path", required=True, type=click.Path(exists=True, dir_okay=False), help="CSV with image/text columns")
 @click.option("--image-col", default="image", help="Image column name in CSV")
 @click.option("--text-col", default="text", help="Text column name in CSV")
 @click.option("--out", "out_path", default="", help="Output CSV path (default: print JSONL to stdout)")
-@click.option("--questions", default="", type=click.Path(exists=True, dir_okay=False),
-              help="Optional path to a file with one VQA question per line")
-@click.option("--negatives", default="", type=click.Path(exists=True, dir_okay=False),
-              help="Optional path to a file with one negative text per line for embedding z-score")
-def cli(config_path: str, csv_path: str, image_col: str, text_col: str, out_path: str, questions: str, negatives: str) -> None:
+def cli(config_path: str, csv_path: str, image_col: str, text_col: str, out_path: str) -> None:
     """Run text–image matching over a CSV of pairs."""
-    matcher = TextImageMatcher.from_yaml(config_path)
+    try:
+        matcher = TextImageMatcher.from_yaml(config_path)
+    except ImportError as e:
+        click.echo(f"Missing optional dependency while building models from YAML: {e}", err=True)
+        click.echo(
+            "Hint: install transformers, sentence-transformers, accelerate, timm, torch;\n"
+            "or edit your YAML models to use local adapters.",
+            err=True,
+        )
+        raise SystemExit(1)
+
     rows = matcher.read_csv(csv_path, image_col=image_col, text_col=text_col)
 
-    vqa_qs: list[str] | None = None
-    if questions:
-        with open(questions, "r", encoding="utf-8") as f:
-            vqa_qs = [ln.strip() for ln in f if ln.strip()]
-
-    negs: list[str] | None = None
-    if negatives:
-        with open(negatives, "r", encoding="utf-8") as f:
-            negs = [ln.strip() for ln in f if ln.strip()]
+    vqa_qs = None
+    negs = None
 
     results: list[dict[str, Any]] = []
     for r in rows:
@@ -692,7 +676,7 @@ def cli(config_path: str, csv_path: str, image_col: str, text_col: str, out_path
     if out_path:
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             fieldnames = list(results[0].keys()) if results else ["image", "text"]
-            w = _csv.DictWriter(f, fieldnames=fieldnames)
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for row in results:
                 w.writerow(row)
