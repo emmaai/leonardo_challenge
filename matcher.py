@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable, TypedDict, Any, Mapping
 import importlib
-import argparse
 import csv as _csv
 import json as _json
 
-import yaml  # Requires PyYAML
+import yaml 
 
-from text_image_matcher_utils import (
+from utils import (
     PILImage, Embedding,
     cosine, sigmoid, soft_f1,
     simple_tokenize, string_similarity, pairwise_best_match,
@@ -260,32 +259,32 @@ def _build_model_from_spec(spec: Mapping[str, Any] | None) -> Any | None:
 DEFAULT_MODEL_SPECS: dict[str, Mapping[str, Any]] = {
     # Embedding via CLIP (transformers)
     "embedding": {
-        "target": "text_image_matcher:HFCLIPAdapter",
+        "target": "matcher:HFCLIPAdapter",
         "init": {"model_name": "openai/clip-vit-base-patch32"},
     },
     # Captioning via BLIP (transformers pipeline)
     "captioner": {
         "target": "transformers:pipeline",
         "init": {"task": "image-to-text", "model": "Salesforce/blip-image-captioning-large"},
-        "wrapper": {"target": "text_image_matcher:_CaptionCallableWrapper", "init": {"method": "__call__", "key": "generated_text"}},
+        "wrapper": {"target": "matcher:_CaptionCallableWrapper", "init": {"method": "__call__", "key": "generated_text"}},
     },
     # STS via Sentence-Transformers
     "sts": {
         "target": "sentence_transformers:SentenceTransformer",
         "init": {"model_name_or_path": "all-mpnet-base-v2"},
-        "wrapper": {"target": "text_image_matcher:_SBERTLikeSTSWrapper", "init": {"encode_method": "encode"}},
+        "wrapper": {"target": "matcher:_SBERTLikeSTSWrapper", "init": {"encode_method": "encode"}},
     },
     # Grounding via OWL-ViT zero-shot detector
     "grounding": {
         "target": "transformers:pipeline",
         "init": {"task": "zero-shot-object-detection", "model": "google/owlvit-base-patch32"},
-        "wrapper": {"target": "text_image_matcher:HFZeroShotDetAdapter"},
+        "wrapper": {"target": "matcher:HFZeroShotDetAdapter"},
     },
     # VQA via ViLT/BLIP VQA pipeline
     "vqa": {
         "target": "transformers:pipeline",
         "init": {"task": "visual-question-answering", "model": "dandelin/vilt-b32-finetuned-vqa"},
-        "wrapper": {"target": "text_image_matcher:HFVQAPipelineAdapter"},
+        "wrapper": {"target": "matcher:HFVQAPipelineAdapter"},
     },
 }
 
@@ -308,8 +307,8 @@ class Calibration:
 
 @dataclass(slots=True)
 class MatcherConfig:
-    weights: Weights = Weights()
-    calibration: Calibration = Calibration()
+    weights: Weights = field(default_factory=Weights)
+    calibration: Calibration = field(default_factory=Calibration)
     ground_entity_w: float = 0.5
     ground_attr_w: float = 0.3
     ground_rel_w: float = 0.2
@@ -385,30 +384,11 @@ class TextImageMatcher:
     str_sim_threshold: 0.6
 
     models:  # any missing entries fall back to built-in DEFAULT_MODEL_SPECS
-      embedding:
-        target: "text_image_matcher:HFCLIPAdapter"
-        init: { model_name: "openai/clip-vit-base-patch32" }
-      captioner:
-        target: "transformers:pipeline"
-        init: { task: "image-to-text", model: "Salesforce/blip-image-captioning-large" }
-        wrapper: { target: "text_image_matcher:_CaptionCallableWrapper", init: { method: "__call__", key: "generated_text" } }
-      sts:
-        target: "sentence_transformers:SentenceTransformer"
-        init: { model_name_or_path: "all-mpnet-base-v2" }
-        wrapper: { target: "text_image_matcher:_SBERTLikeSTSWrapper", init: { encode_method: "encode" } }
-      grounding:
-        target: "transformers:pipeline"
-        init: { task: "zero-shot-object-detection", model: "google/owlvit-base-patch32" }
-        wrapper: { target: "text_image_matcher:HFZeroShotDetAdapter" }
-      vqa:
-        target: "transformers:pipeline"
-        init: { task: "visual-question-answering", model: "dandelin/vilt-b32-finetuned-vqa" }
-        wrapper: { target: "text_image_matcher:HFVQAPipelineAdapter" }
     """
 
     def __init__(
         self,
-        config: MatcherConfig = MatcherConfig(),
+        config: MatcherConfig | None = None,
         *,
         embed_model: EmbeddingModel | None = None,
         captioner: Captioner | None = None,
@@ -416,7 +396,7 @@ class TextImageMatcher:
         grounding_model: GroundingModel | None = None,
         vqa_model: VQAModel | None = None,
     ) -> None:
-        self.cfg = config
+        self.cfg = config or MatcherConfig()
         self.embed_model = embed_model
         self.captioner = captioner
         self.sts_model = sts_model

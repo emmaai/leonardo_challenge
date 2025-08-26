@@ -12,8 +12,9 @@ import importlib
 import numpy as np
 import pytest
 from PIL import Image as PILImage
+from matcher import TextImageMatcher
 
-RUN_INTEGRATION = os.environ.get("RUN_HF_INTEGRATION", "0") == "1"
+RUN_INTEGRATION = os.environ.get("RUN_HF_INTEGRATION", "1") == "1"
 
 
 def _hf_available() -> bool:
@@ -29,10 +30,6 @@ def _hf_available() -> bool:
 skip_no_run = pytest.mark.skipif(not RUN_INTEGRATION, reason="Set RUN_HF_INTEGRATION=1 to run integration tests")
 skip_no_hf = pytest.mark.skipif(not _hf_available(), reason="Hugging Face stack not installed")
 
-# Import the library under test
-text_image_matcher = importlib.import_module("text_image_matcher")
-TextImageMatcher = text_image_matcher.TextImageMatcher
-
 
 def _make_test_image(path: Path, color=(255, 0, 0), size=(128, 128)) -> Path:
     img = PILImage.new("RGB", size, color)
@@ -45,7 +42,7 @@ def _make_test_image(path: Path, color=(255, 0, 0), size=(128, 128)) -> Path:
 @skip_no_hf
 def default_yaml(tmp_path_factory: pytest.TempPathFactory) -> Path:
     # Minimal YAML: omit `models:` so the class uses DEFAULT_MODEL_SPECS
-    p = tmp_path_factory.mktemp("cfg") / "matcher_config.yaml"
+    p = tmp_path_factory.mktemp("cfg") / "config.yaml"
     p.write_text(
         "weights: {alpha_embed: 0.4, beta_caption: 0.2, gamma_ground: 0.2, delta_vqa: 0.2}\n"
         "str_sim_threshold: 0.6\n",
@@ -71,7 +68,6 @@ def red_image(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return _make_test_image(tmp_path_factory.mktemp("data") / "red.png", (255, 0, 0))
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_default_models_build(matcher: TextImageMatcher):
@@ -83,7 +79,6 @@ def test_default_models_build(matcher: TextImageMatcher):
     assert matcher.vqa_model is not None
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_embedding_interface(matcher: TextImageMatcher, red_image: Path):
@@ -94,7 +89,6 @@ def test_embedding_interface(matcher: TextImageMatcher, red_image: Path):
     assert isinstance(v_txt, np.ndarray) and v_txt.ndim == 1 and np.isfinite(v_txt).all()
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_captioner_interface(matcher: TextImageMatcher, red_image: Path):
@@ -103,7 +97,6 @@ def test_captioner_interface(matcher: TextImageMatcher, red_image: Path):
     assert isinstance(cap, str) and len(cap.strip()) > 0
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_sts_interface(matcher: TextImageMatcher):
@@ -113,7 +106,6 @@ def test_sts_interface(matcher: TextImageMatcher):
     assert sim_same >= sim_diff
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_grounding_interface(matcher: TextImageMatcher, red_image: Path):
@@ -123,7 +115,6 @@ def test_grounding_interface(matcher: TextImageMatcher, red_image: Path):
     # do not assert specific keys; some models may return empty results on synthetic images
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_vqa_interface(matcher: TextImageMatcher, red_image: Path):
@@ -132,7 +123,6 @@ def test_vqa_interface(matcher: TextImageMatcher, red_image: Path):
     assert isinstance(p, float) and 0.0 <= p <= 1.0
 
 
-@pytest.mark.integration
 @skip_no_run
 @skip_no_hf
 def test_score_all_smoke(matcher: TextImageMatcher, red_image: Path):

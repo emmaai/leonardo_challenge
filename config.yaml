@@ -14,28 +14,37 @@ str_sim_threshold: 0.6
 models:
   embedding:
     target: "matcher:HFCLIPAdapter"
-    init: { model_name: "openai/clip-vit-base-patch32" }
+    init:
+      model_name: "openai/clip-vit-base-patch32"
+      device: "cuda"                # CLIP adapter will .to("cuda")
 
   captioner:
     target: "transformers:pipeline"
-    init: { task: "image-to-text", model: "Salesforce/blip-image-captioning-large" }
-    wrapper:
-      target: "matcher:_CaptionCallableWrapper"
-      init: { method: "__call__", key: "generated_text" }
+    init:
+      task: "image-to-text"
+      model: "Salesforce/blip-image-captioning-base"
+      device_map: "auto"            # or: device: 0
+      torch_dtype: "auto"
+      # model_kwargs: { use_safetensors: true }   # optional, recommended
 
   sts:
     target: "sentence_transformers:SentenceTransformer"
-    init: { model_name_or_path: "all-mpnet-base-v2" }
-    wrapper:
-      target: "matcher:_SBERTLikeSTSWrapper"
-      init: { encode_method: "encode" }
+    init:
+      model_name_or_path: "all-MiniLM-L6-v2"
+      device: "cuda"                # ensures encode runs on GPU
 
   grounding:
     target: "transformers:pipeline"
-    init: { task: "zero-shot-object-detection", model: "google/owlvit-base-patch32" }
-    wrapper: { target: "matcher:HFZeroShotDetAdapter" }
+    init:
+      task: "zero-shot-object-detection"
+      model: "google/owlvit-base-patch32"
+      device_map: "auto"            # or device: 0
+      torch_dtype: "auto"
 
   vqa:
     target: "transformers:pipeline"
-    init: { task: "visual-question-answering", model: "dandelin/vilt-b32-finetuned-vqa" }
-    wrapper: { target: "matcher:HFVQAPipelineAdapter" }
+    init:
+      task: "visual-question-answering"
+      model: "dandelin/vilt-b32-finetuned-vqa"
+      device_map: "auto"            # or device: 0
+      torch_dtype: "auto"

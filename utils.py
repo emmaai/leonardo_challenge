@@ -1,4 +1,3 @@
-# text_image_matcher_utils.py
 from __future__ import annotations
 
 from pathlib import Path
